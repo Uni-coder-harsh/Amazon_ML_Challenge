@@ -1,88 +1,127 @@
 """
 normalizer.py
-Robust, domain-agnostic text normalization and feature extraction engine
-for multi-lingual business entity records (US, India, France).
+─────────────
+Robust text normalization that:
+  - Handles Latin, Devanagari, Tamil, Telugu, French (UTF-8 preserved)
+  - Canonicalizes legal suffixes (Pvt Ltd → '', Corp → '', etc.)
+  - Normalizes address abbreviations (St → Street for token overlap)
+  - Returns both a cleaned string AND a token-set for blocking
 """
 
 import re
 import unicodedata
-from typing import Set, List
 
-# Common stop words across US, India, and France addresses/names
-STOP_WORDS = {
-    'the', 'and', 'of', 'in', 'at', 'on', 'for', 'to', 'a', 'an',
-    'de', 'la', 'le', 'et', 'du', 'des', 'en', 'les', 'par', 'pour', 'd', 'l',
-    'near', 'opp', 'opposite', 'behind', 'beside', 'unit', 'suite', 'apt', 'floor',
-    'road', 'street', 'ave', 'avenue', 'rd', 'st', 'lane', 'dr', 'drive', 'blvd'
+# ── Legal suffix canonicalization ──────────────────────────────────────────
+_LEGAL = re.compile(
+    r"\b(pvt\.?|private|ltd\.?|limited|llc|l\.l\.c\.?|inc\.?|incorporated|"
+    r"corp\.?|corporation|co\.?|llp|l\.l\.p\.?|lp|l\.p\.?|"
+    r"gmbh|ag|sas|sarl|s\.a\.r\.l\.?|sa|s\.a\.?|pty|"
+    r"plc|p\.l\.c\.?|bhd|sdn|nv|bv|cv|"
+    r"enterprises?|enterprise|solutions?|solution|"
+    r"services?|service|group|holding|holdings|"
+    r"trading|traders?|industries|industry|"
+    r"international|intl|india|pvt\.?\s*ltd\.?)\b",
+    re.IGNORECASE,
+)
+
+# ── Address abbreviation expansion (for token overlap improvement) ─────────
+_ADDR_ABBR = {
+    r"\bst\b": "street",
+    r"\brd\b": "road",
+    r"\bave?\b": "avenue",
+    r"\bblvd\b": "boulevard",
+    r"\bdr\b": "drive",
+    r"\bln\b": "lane",
+    r"\bct\b": "court",
+    r"\bpl\b": "place",
+    r"\bnr\b": "near",
+    r"\bopp\b": "opposite",
+    r"\bdist\b": "district",
+    r"\bflr\b": "floor",
+    r"\bfloor\b": "floor",
+    r"\bno\b": "number",
+    r"\bnagar\b": "nagar",
+    r"\bph\b": "phase",
 }
 
-LEGAL_SUFFIX_REPLACEMENTS = [
-    (r'\b(private limited|pvt\.?\s*ltd\.?)\b', ' pvt ltd '),
-    (r'\b(limited liability company|llc)\b', ' llc '),
-    (r'\b(limited liability partnership|llp)\b', ' llp '),
-    (r'\b(incorporated|inc\.?)\b', ' inc '),
-    (r'\b(corporation|corp\.?)\b', ' corp '),
-    (r'\b(limited|ltd\.?)\b', ' ltd '),
-    (r'\b(company|co\.?)\b', ' co '),
-    (r'\b(societe a responsabilite limitee|sarl)\b', ' sarl '),
-    (r'\b(societe par actions simplifiee unipersonnelle|sasu)\b', ' sasu '),
-    (r'\b(societe par actions simplifiee|sas)\b', ' sas '),
-    (r'\b(societe anonyme|sa)\b', ' sa '),
-    (r'\b(entreprise unipersonnelle a responsabilite limitee|eurl)\b', ' eurl '),
-    (r'\b(societe civile immobiliere|sci)\b', ' sci '),
-]
+# ── Punctuation / symbol noise ─────────────────────────────────────────────
+_PUNCT = re.compile(r"[^\w\s]", re.UNICODE)
+_SPACE = re.compile(r"\s+")
 
-LEGAL_REGEXES = [(re.compile(pattern, re.IGNORECASE), repl) for pattern, repl in LEGAL_SUFFIX_REPLACEMENTS]
-DOMAIN_RE = re.compile(r'https?://(?:www\.)?|\bwww\.', re.IGNORECASE)
-EXT_RE = re.compile(r'\.(com|in|fr|org|net|co\.in|co|io|biz|info)\b', re.IGNORECASE)
-PUNCT_RE = re.compile(r'[^\w\s]', re.UNICODE)
-DIGIT_RE = re.compile(r'\b\d+\b')
+# ── Stop tokens (too common to be useful for blocking) ────────────────────
+_STOP = {
+    "the", "and", "of", "in", "at", "to", "a", "an", "for", "by",
+    "on", "with", "near", "shop", "store", "house", "centre", "center",
+    "new", "old", "main", "big", "small", "no", "num", "number",
+}
 
 
-def normalize_text(text: str) -> str:
+def normalize(text: str, expand_addr: bool = False) -> str:
     """
-    Decomposes Unicode (NFKD), folds accents, strips domain names,
-    normalizes corporate suffixes, strips punctuation, and standardizes whitespace.
+    Normalize text preserving Unicode (Indic scripts, accented French chars).
+    Returns lowercase cleaned string.
     """
-    if not text:
-        return ''
-    # NFKD decomposition folds accents (é -> e, etc.)
-    text = unicodedata.normalize('NFKD', str(text)).encode('ASCII', 'ignore').decode('utf-8').lower()
-    text = DOMAIN_RE.sub('', text)
-    text = EXT_RE.sub('', text)
-    for rgx, repl in LEGAL_REGEXES:
-        text = rgx.sub(repl, text)
-    text = PUNCT_RE.sub(' ', text)
-    return ' '.join(text.split())
+    if not text or not text.strip():
+        return ""
+
+    t = text.strip()
+
+    # Normalize Unicode (NFC keeps Indic scripts intact; NFD would too)
+    t = unicodedata.normalize("NFC", t)
+
+    # Remove legal suffixes BEFORE lowercasing for pattern matching
+    t = _LEGAL.sub(" ", t)
+
+    # Lowercase
+    t = t.lower()
+
+    # Address abbreviation expansion
+    if expand_addr:
+        for pat, repl in _ADDR_ABBR.items():
+            t = re.sub(pat, repl, t)
+
+    # Remove punctuation (keep Unicode word chars and spaces)
+    t = _PUNCT.sub(" ", t)
+
+    # Collapse whitespace
+    t = _SPACE.sub(" ", t).strip()
+
+    return t
 
 
-def extract_digits(text: str) -> Set[str]:
+def get_tokens(text: str, min_len: int = 2, remove_stop: bool = True) -> set:
     """
-    Extracts all digit tokens from text (street numbers, PIN/zip codes).
+    Returns a set of tokens from normalized text.
+    Keeps Indic/French/Latin tokens as-is (Unicode-aware split).
     """
-    if not text:
-        return set()
-    return set(DIGIT_RE.findall(str(text)))
+    n = normalize(text)
+    tokens = set(n.split())
+    tokens = {t for t in tokens if len(t) >= min_len}
+    if remove_stop:
+        tokens -= _STOP
+    return tokens
 
 
-def tokenize(text: str, min_len: int = 2) -> List[str]:
+def get_ngrams(text: str, n: int = 3) -> set:
     """
-    Tokenizes normalized string into meaningful non-stopword tokens.
+    Character n-grams from normalized text.
+    Works for any script (Indic, Latin, etc.) since we work on Unicode chars.
     """
-    if not text:
-        return []
-    tokens = text.split()
-    return [t for t in tokens if len(t) >= min_len and t not in STOP_WORDS]
+    norm = normalize(text)
+    if len(norm) < n:
+        return {norm} if norm else set()
+    return {norm[i : i + n] for i in range(len(norm) - n + 1)}
 
 
-def get_char_ngrams(text: str, n: int = 3) -> Set[str]:
+def make_blocking_key(text: str) -> list:
     """
-    Generates character n-grams with boundary markers.
+    Returns a list of blocking keys for inverted-index blocking.
+    Keys are individual tokens (not stop words, len ≥ 3).
     """
-    if not text:
-        return set()
-    compact = ''.join(text.split())
-    if len(compact) < n:
-        return {compact}
-    padded = f"^{compact}$"
-    return {padded[i:i+n] for i in range(len(padded) - n + 1)}
+    tokens = get_tokens(text, min_len=3, remove_stop=True)
+    return list(tokens)
+
+
+def extract_digits(text: str) -> list:
+    """Extract digit sequences from address (house numbers, PIN codes)."""
+    return re.findall(r"\d{2,}", text or "")

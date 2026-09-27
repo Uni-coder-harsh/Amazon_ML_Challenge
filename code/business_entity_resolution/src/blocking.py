@@ -1,104 +1,100 @@
 """
 blocking.py
-High-throughput multi-key inverted index blocking engine.
-Generates candidate pairs per country with high recall (Pairs Completeness >= 0.98).
+───────────
+Scored inverted-index blocking with ranking before candidate capping.
+
+Key insight: naive union of token postings lists blows up for common tokens
+like "technology", "pvt", "services" — leading to thousands of useless
+candidates. The fix: count how many query tokens each candidate matches,
+then rank by that score before capping to MAX_CANDIDATES.
+
+Also separates name tokens (weight=2), address digits (weight=3, very
+discriminative), and address location tokens (weight=1).
 """
 
+from __future__ import annotations
+
 from collections import defaultdict
-from typing import List, Dict, Set, Tuple
-from normalizer import normalize_text, tokenize, extract_digits
+from typing import Iterable
+
+from normalizer import get_tokens, extract_digits, get_ngrams
 
 
-class MultiKeyBlocker:
+class LexicalBlocker:
     """
-    Multi-Key Inverted Index Blocker.
-    Indexes target records (S2 + S3) by:
-      1. Normalized Name Core Tokens (length >= 3)
-      2. Address Digits / Numbers (house numbers, PIN codes)
-      3. Address Distinctive Locality Tokens (length >= 4)
+    Scored inverted-index blocker.
+    Candidate score = sum of matched token weights.
+    Only top-MAX_CANDIDATES by score are returned.
     """
 
-    def __init__(self, max_postings_token: int = 1500, max_postings_digit: int = 800, top_k: int = 25):
-        self.max_postings_token = max_postings_token
-        self.max_postings_digit = max_postings_digit
-        self.top_k = top_k
-        self.name_token_index = defaultdict(list)
-        self.addr_token_index = defaultdict(list)
-        self.digit_index = defaultdict(list)
-        self.target_records: List[Dict] = []
-        self.target_metadata: List[Dict] = []
+    def __init__(self, max_candidates: int = 40):
+        self.max_candidates = max_candidates
+        self._name_index:  dict[str, list[str]] = defaultdict(list)
+        self._digit_index: dict[str, list[str]] = defaultdict(list)
+        self._ngram_index: dict[str, list[str]] = defaultdict(list)
 
-    def fit(self, targets: List[Dict]):
+    def index(self, records: Iterable[tuple[str, str, str]]) -> "LexicalBlocker":
+        """records: iterable of (entity_id, business_name, business_address)"""
+        for eid, name, addr in records:
+            for tok in get_tokens(name, min_len=3, remove_stop=True):
+                self._name_index[tok].append(eid)
+            for dig in extract_digits(addr):
+                self._digit_index[dig].append(eid)
+            for ng in get_ngrams(name, n=3):
+                if len(ng) == 3:
+                    self._ngram_index[ng].append(eid)
+        return self
+
+    def query(self, name: str, addr: str, use_ngrams: bool = True) -> set[str]:
         """
-        Builds inverted indexes over target records.
-        targets is a list of dicts with keys: 'entity_id', 'business_name', 'business_address'
+        Score every candidate by how many query features it matches,
+        then return top max_candidates by score.
         """
-        self.target_records = targets
-        self.target_metadata = []
-        self.name_token_index.clear()
-        self.addr_token_index.clear()
-        self.digit_index.clear()
+        scores: dict[str, int] = {}
 
-        for idx, r in enumerate(targets):
-            nn = normalize_text(r.get('business_name', ''))
-            na = normalize_text(r.get('business_address', ''))
-            digits = extract_digits(na)
-            tokens = tokenize(nn, min_len=3)
-            addr_tokens = tokenize(na, min_len=4)
+        def add(postings: list[str], weight: int):
+            for eid in postings:
+                scores[eid] = scores.get(eid, 0) + weight
 
-            self.target_metadata.append({
-                'entity_id': r['entity_id'],
-                'norm_name': nn,
-                'norm_addr': na,
-                'digits': digits,
-                'missing_addr': 1.0 if not na else 0.0,
-                'is_s2': 1.0 if r['entity_id'].startswith('S2-') else 0.0
-            })
+        # Name tokens — weight 2 each
+        name_tokens = get_tokens(name, min_len=3, remove_stop=True)
+        for tok in name_tokens:
+            add(self._name_index.get(tok, []), 2)
 
-            for t in tokens:
-                self.name_token_index[t].append(idx)
-            for d in digits:
-                self.digit_index[d].append(idx)
-            for at in addr_tokens:
-                self.addr_token_index[at].append(idx)
+        # Address digit anchors — weight 3 each (highly discriminative)
+        for dig in extract_digits(addr):
+            add(self._digit_index.get(dig, []), 3)
 
-    def retrieve_candidates(self, s1_name: str, s1_addr: str) -> List[Tuple[int, int]]:
-        """
-        Retrieves top candidate indices and initial scores for an S1 entity.
-        Returns list of (target_idx, lexical_score).
-        """
-        s1_nn = normalize_text(s1_name)
-        s1_na = normalize_text(s1_addr)
-        s1_digits = extract_digits(s1_na)
-        s1_tokens = tokenize(s1_nn, min_len=3)
-        s1_addr_tokens = tokenize(s1_na, min_len=4)
+        # N-gram fallback: only if name tokens gave very few results
+        # (catches transliterations, domain names, abbreviations)
+        if use_ngrams:
+            n_strong = sum(1 for v in scores.values() if v >= 4)
+            if n_strong < 10:
+                for ng in get_ngrams(name, n=3):
+                    if len(ng) == 3:
+                        add(self._ngram_index.get(ng, []), 1)
 
-        cand_scores = defaultdict(int)
+        if not scores:
+            return set()
 
-        # Name token match (weight 3)
-        for t in s1_tokens:
-            postings = self.name_token_index.get(t)
-            if postings and len(postings) <= self.max_postings_token:
-                for p in postings:
-                    cand_scores[p] += 3
+        # Require score >= 2 (at least one name token match OR one digit match)
+        # Fall back to score >= 1 if nothing qualifies
+        min_score = 2
+        ranked = sorted(
+            [(eid, s) for eid, s in scores.items() if s >= min_score],
+            key=lambda x: -x[1],
+        )
+        if not ranked:
+            ranked = sorted(scores.items(), key=lambda x: -x[1])
 
-        # Addr digits match (weight 3)
-        for d in s1_digits:
-            postings = self.digit_index.get(d)
-            if postings and len(postings) <= self.max_postings_digit:
-                for p in postings:
-                    cand_scores[p] += 3
+        return {eid for eid, _ in ranked[: self.max_candidates]}
 
-        # Addr tokens match (weight 2)
-        for at in s1_addr_tokens:
-            postings = self.addr_token_index.get(at)
-            if postings and len(postings) <= self.max_postings_digit:
-                for p in postings:
-                    cand_scores[p] += 2
-
-        if not cand_scores:
-            return []
-
-        # Return top_k candidates sorted by lexical score
-        top_cands = sorted(cand_scores.items(), key=lambda x: x[1], reverse=True)[:self.top_k]
-        return top_cands
+    def query_batch(
+        self,
+        queries: list[tuple[str, str, str]],
+        use_ngrams: bool = True,
+    ) -> dict[str, set[str]]:
+        return {
+            qid: self.query(name, addr, use_ngrams=use_ngrams)
+            for qid, name, addr in queries
+        }

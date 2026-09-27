@@ -1,63 +1,168 @@
 """
 features.py
-Feature engineering module computing 16-D pairwise similarity features
-between reference entities and candidate target records using RapidFuzz.
+───────────
+Feature engineering for the pairwise matching classifier.
+Uses both lexical similarity (rapidfuzz) and embedding cosine similarity.
+
+Features (22 total):
+  Lexical:
+    0  name_token_sort_ratio      RapidFuzz token sort ratio (name)
+    1  name_partial_ratio         RapidFuzz partial ratio (name)
+    2  name_token_set_ratio       RapidFuzz token set ratio (name)
+    3  name_jaro_winkler          Jaro-Winkler on normalized names
+    4  addr_token_sort_ratio      Token sort ratio (address)
+    5  addr_partial_ratio         Partial ratio (address)
+    6  name_token_overlap         Jaccard on name token sets
+    7  addr_token_overlap         Jaccard on address token sets
+    8  name_ngram_overlap_3       Jaccard on 3-gram sets (name)
+    9  addr_digit_overlap         Fraction of shared digit sequences
+   10  country_match              1 if same country string
+   11  name_len_ratio             min(len_a,len_b)/max(len_a,len_b)
+   12  addr_len_ratio             same for address
+   13  name_is_prefix             1 if shorter name is prefix of longer
+   14  name_edit_dist_norm        1 - normalized Levenshtein distance
+
+  Embedding:
+   15  name_emb_cosine            Cosine sim of name embeddings (if available)
+   16  addr_emb_cosine            Cosine sim of address embeddings (if available)
+   17  combined_emb_cosine        Cosine sim of (name|addr) embeddings
+
+  Structural:
+   18  both_name_empty            1 if both names empty
+   19  both_addr_empty            1 if both addresses empty
+   20  name_a_empty               1 if query name empty
+   21  name_b_empty               1 if target name empty
 """
 
-from typing import Dict, List, Set
-from rapidfuzz import fuzz, distance
-from normalizer import get_char_ngrams, tokenize, extract_digits
+from __future__ import annotations
+
+import numpy as np
+from rapidfuzz import fuzz, distance as rfdist
+from normalizer import normalize, get_tokens, get_ngrams, extract_digits
+
+N_FEATURES = 22
 
 
-def compute_pair_features(s1_cache: Dict, t_meta: Dict, blocking_score: float) -> List[float]:
-    """
-    Computes a 16-dimensional dense feature vector for candidate pair (s1, target).
-    s1_cache contains precomputed:
-      'norm_name', 'norm_addr', 'digits', 'tokens', 'ngrams'
-    t_meta contains precomputed:
-      'norm_name', 'norm_addr', 'digits', 'missing_addr', 'is_s2'
-    """
-    s1_name = s1_cache['norm_name']
-    t_name = t_meta['norm_name']
+def compute_features(
+    name_a: str,
+    addr_a: str,
+    name_b: str,
+    addr_b: str,
+    emb_a: np.ndarray | None = None,
+    emb_b: np.ndarray | None = None,
+    name_emb_a: np.ndarray | None = None,
+    name_emb_b: np.ndarray | None = None,
+    addr_emb_a: np.ndarray | None = None,
+    addr_emb_b: np.ndarray | None = None,
+    country_a: str = "",
+    country_b: str = "",
+) -> np.ndarray:
+    """Compute feature vector for a pair (name_a, addr_a) vs (name_b, addr_b)."""
+    feat = np.zeros(N_FEATURES, dtype=np.float32)
 
-    # 1. Name string metrics
-    n_rat = fuzz.ratio(s1_name, t_name) / 100.0
-    n_prat = fuzz.partial_ratio(s1_name, t_name) / 100.0
-    n_sort = fuzz.token_sort_ratio(s1_name, t_name) / 100.0
-    n_set = fuzz.token_set_ratio(s1_name, t_name) / 100.0
-    n_jw = distance.JaroWinkler.similarity(s1_name, t_name)
+    # Normalize
+    na = normalize(name_a)
+    nb = normalize(name_b)
+    aa = normalize(addr_a, expand_addr=True)
+    ab = normalize(addr_b, expand_addr=True)
 
-    # 2. Name subword & token overlaps
-    t_ngrams = get_char_ngrams(t_name, n=3)
-    u_ng = s1_cache['ngrams'] | t_ngrams
-    n_ng_jacc = len(s1_cache['ngrams'] & t_ngrams) / len(u_ng) if u_ng else 0.0
+    empty_na = len(na) == 0
+    empty_nb = len(nb) == 0
+    empty_aa = len(aa) == 0
+    empty_ab = len(ab) == 0
 
-    t_tokens = set(tokenize(t_name, min_len=2))
-    u_tok = s1_cache['tokens'] | t_tokens
-    n_tok_jacc = len(s1_cache['tokens'] & t_tokens) / len(u_tok) if u_tok else 0.0
-
-    len_diff = float(abs(len(s1_name) - len(t_name)))
-
-    # 3. Address string & structural metrics
-    if t_meta['missing_addr']:
-        a_rat = 0.0
-        a_sort = 0.0
-        a_set = 0.0
-        dig_jacc = 0.0
-        dig_exact = 0.0
+    # ── Lexical name features ──────────────────────────────────────────────
+    if not empty_na and not empty_nb:
+        feat[0] = fuzz.token_sort_ratio(na, nb) / 100.0
+        feat[1] = fuzz.partial_ratio(na, nb) / 100.0
+        feat[2] = fuzz.token_set_ratio(na, nb) / 100.0
+        feat[3] = rfdist.JaroWinkler.normalized_similarity(na, nb)
+        # Edit distance
+        max_len = max(len(na), len(nb))
+        feat[14] = 1.0 - rfdist.Levenshtein.normalized_distance(na, nb)
+        # Prefix check
+        short, long_ = (na, nb) if len(na) <= len(nb) else (nb, na)
+        feat[13] = 1.0 if (short and long_.startswith(short)) else 0.0
+        # Len ratio
+        if max_len > 0:
+            feat[11] = min(len(na), len(nb)) / max_len
     else:
-        s1_addr = s1_cache['norm_addr']
-        t_addr = t_meta['norm_addr']
-        a_rat = fuzz.ratio(s1_addr, t_addr) / 100.0
-        a_sort = fuzz.token_sort_ratio(s1_addr, t_addr) / 100.0
-        a_set = fuzz.token_set_ratio(s1_addr, t_addr) / 100.0
+        # partial info: at least set len ratio
+        max_len = max(len(na), len(nb)) if (na or nb) else 1
+        if max_len > 0:
+            feat[11] = min(len(na), len(nb)) / max_len
 
-        u_dig = s1_cache['digits'] | t_meta['digits']
-        dig_jacc = len(s1_cache['digits'] & t_meta['digits']) / len(u_dig) if u_dig else 0.0
-        dig_exact = 1.0 if s1_cache['digits'] and s1_cache['digits'] == t_meta['digits'] else 0.0
+    # ── Lexical address features ───────────────────────────────────────────
+    if not empty_aa and not empty_ab:
+        feat[4] = fuzz.token_sort_ratio(aa, ab) / 100.0
+        feat[5] = fuzz.partial_ratio(aa, ab) / 100.0
+        max_len_a = max(len(aa), len(ab))
+        if max_len_a > 0:
+            feat[12] = min(len(aa), len(ab)) / max_len_a
 
-    return [
-        n_rat, n_prat, n_sort, n_set, n_jw, n_ng_jacc, n_tok_jacc, len_diff,
-        a_rat, a_sort, a_set, dig_jacc, dig_exact,
-        t_meta['missing_addr'], t_meta['is_s2'], float(blocking_score)
-    ]
+    # ── Token overlap features ─────────────────────────────────────────────
+    tna = get_tokens(name_a, min_len=2, remove_stop=False)
+    tnb = get_tokens(name_b, min_len=2, remove_stop=False)
+    if tna or tnb:
+        feat[6] = len(tna & tnb) / max(len(tna | tnb), 1)
+
+    taa = get_tokens(addr_a, min_len=2, remove_stop=False)
+    tab = get_tokens(addr_b, min_len=2, remove_stop=False)
+    if taa or tab:
+        feat[7] = len(taa & tab) / max(len(taa | tab), 1)
+
+    # ── N-gram overlap (name) ─────────────────────────────────────────────
+    ng_na = get_ngrams(name_a, n=3)
+    ng_nb = get_ngrams(name_b, n=3)
+    if ng_na or ng_nb:
+        feat[8] = len(ng_na & ng_nb) / max(len(ng_na | ng_nb), 1)
+
+    # ── Digit overlap (address) ───────────────────────────────────────────
+    da = set(extract_digits(addr_a))
+    db = set(extract_digits(addr_b))
+    if da or db:
+        feat[9] = len(da & db) / max(len(da | db), 1)
+
+    # ── Country match ─────────────────────────────────────────────────────
+    feat[10] = 1.0 if (country_a and country_b and country_a == country_b) else 0.0
+
+    # ── Embedding cosine similarities ─────────────────────────────────────
+    def cosine(a: np.ndarray, b: np.ndarray) -> float:
+        if a is None or b is None:
+            return 0.0
+        na_ = np.linalg.norm(a)
+        nb_ = np.linalg.norm(b)
+        if na_ < 1e-8 or nb_ < 1e-8:
+            return 0.0
+        return float(np.dot(a, b) / (na_ * nb_))
+
+    feat[15] = cosine(name_emb_a, name_emb_b)
+    feat[16] = cosine(addr_emb_a, addr_emb_b)
+    feat[17] = cosine(emb_a, emb_b)
+
+    # ── Structural flags ──────────────────────────────────────────────────
+    feat[18] = 1.0 if (empty_na and empty_nb) else 0.0
+    feat[19] = 1.0 if (empty_aa and empty_ab) else 0.0
+    feat[20] = 1.0 if empty_na else 0.0
+    feat[21] = 1.0 if empty_nb else 0.0
+
+    return feat
+
+
+def compute_features_batch(
+    pairs: list[tuple],
+    embeddings: dict[str, np.ndarray] | None = None,
+) -> np.ndarray:
+    """
+    pairs: list of (id_a, name_a, addr_a, country_a, id_b, name_b, addr_b, country_b)
+    embeddings: optional dict entity_id → embedding vector (combined name|addr)
+    Returns: (N, N_FEATURES) feature matrix
+    """
+    n = len(pairs)
+    X = np.zeros((n, N_FEATURES), dtype=np.float32)
+    for i, (id_a, na, aa, ca, id_b, nb, ab, cb) in enumerate(pairs):
+        emb_a = embeddings.get(id_a) if embeddings else None
+        emb_b = embeddings.get(id_b) if embeddings else None
+        X[i] = compute_features(na, aa, nb, ab, emb_a=emb_a, emb_b=emb_b,
+                                 country_a=ca, country_b=cb)
+    return X

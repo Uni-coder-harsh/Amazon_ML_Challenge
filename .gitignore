@@ -1,12 +1,17 @@
 dataset/
 output/
 output1/
+output2/
+output_v5/
+*.log
+.DS_Store
 # Model artifacts & checkpoints (large binary files)
 code/business_entity_resolution/artifacts/*.parquet
 code/business_entity_resolution/artifacts/*.joblib
-pycache/
+__pycache__/
 *.pyc
 *.pyo
 .Python
 *.zip
 artifacts/
+
